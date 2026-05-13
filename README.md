@@ -31,7 +31,7 @@ The **union** of all connected IDEs' tool lists is returned, so IDE-specific too
 
 ## Enabling the JetBrains MCP Server
 
-In your IDE: **Settings → Tools → AI Assistant → Enable Model Context Protocol (MCP)**
+In your IDE: **Settings → Tools → MCP Server → Enable MCP Server**
 
 The server starts on an automatically chosen port beginning at 64342.
 
