@@ -210,10 +210,27 @@ async def _post(url: str, method: str, params: dict, *, _retry: bool = True) -> 
 
 
 async def _project_paths_at(url: str) -> list[str]:
-    """Return normalised project paths open in the IDE at ``url``, or [] on failure."""
+    """Return normalised project paths open in the IDE at ``url``, or [] on failure.
+
+    When ``get_repositories`` is called without ``projectPath`` the IDE returns
+    ``isError: true`` but still embeds the open-project list in ``structuredContent``,
+    which is the authoritative source. The ``content[0].text`` fallback exists for
+    future IDE versions that may change the response format.
+    """
     try:
         result = await _post(url, "tools/call", {"name": "get_repositories", "arguments": {}})
         paths: list[str] = []
+
+        # Primary: structuredContent.projects (reliable structured data)
+        struct = result.get("structuredContent") or {}
+        if "projects" in struct:
+            for repo in struct["projects"]:
+                p = repo.get("path") or ""
+                if p:
+                    paths.append(_norm(p))
+            return paths
+
+        # Fallback: parse content[0].text as JSON
         for item in result.get("content", []):
             if item.get("type") != "text":
                 continue
@@ -231,11 +248,7 @@ async def _project_paths_at(url: str) -> list[str]:
                     if p:
                         paths.append(_norm(p))
             except json.JSONDecodeError:
-                # Fallback: treat each non-empty line as a path
-                for ln in text.splitlines():
-                    ln = ln.strip()
-                    if ln:
-                        paths.append(_norm(ln))
+                pass
         return paths
     except Exception as exc:
         log.debug("get_repositories at %s failed: %s", url, exc)
@@ -310,25 +323,38 @@ async def handle_list_tools() -> list[types.Tool]:
     in PyCharm, ``run_inspection_kts`` in RustRover). Returning the union ensures
     the coding agent can see and invoke all available tools regardless of which
     IDE happens to respond first.
+
+    All candidate ports are probed concurrently to avoid sequential timeouts on
+    dead ports (each dead port takes ~2 s on Windows; sequential × 8 dead = 16+ s).
     """
     seen: dict[str, types.Tool] = {}  # name → Tool (first schema wins for duplicates)
-    for port in range(_PORT_START, _PORT_START + _PORT_COUNT):
+
+    async def _fetch_from(port: int) -> list[dict]:
         url = _stream_url(port)
         try:
             result = await _post(url, "tools/list", {})
-            for t in result.get("tools", []):
-                name = t["name"]
-                if name not in seen:
-                    seen[name] = types.Tool(
-                        name=name,
-                        description=t.get("description", ""),
-                        inputSchema=t.get(
-                            "inputSchema", {"type": "object", "properties": {}}
-                        ),
-                    )
-            log.debug("Collected tools from %s (total so far: %d)", url, len(seen))
+            tools = result.get("tools", [])
+            log.debug("Collected %d tools from port %d", len(tools), port)
+            return tools
         except Exception as exc:
             log.debug("tools/list at port %d failed: %s", port, exc)
+            return []
+
+    all_results = await asyncio.gather(
+        *(_fetch_from(p) for p in range(_PORT_START, _PORT_START + _PORT_COUNT)),
+        return_exceptions=False,
+    )
+    for tools in all_results:
+        for t in tools:
+            name = t["name"]
+            if name not in seen:
+                seen[name] = types.Tool(
+                    name=name,
+                    description=t.get("description", ""),
+                    inputSchema=t.get(
+                        "inputSchema", {"type": "object", "properties": {}}
+                    ),
+                )
 
     if not seen:
         raise RuntimeError(
@@ -385,7 +411,7 @@ async def _run() -> None:
     global _http
     _load_cache()
     _http = httpx.AsyncClient(
-        timeout=httpx.Timeout(connect=5.0, read=60.0, write=10.0, pool=5.0)
+        timeout=httpx.Timeout(connect=1.5, read=60.0, write=10.0, pool=5.0)
     )
     try:
         async with stdio_server() as (read_stream, write_stream):
