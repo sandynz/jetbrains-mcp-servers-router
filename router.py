@@ -83,7 +83,7 @@ def _load_cache() -> None:
             data = json.loads(_CACHE_PATH.read_text(encoding="utf-8"))
             if isinstance(data, dict):
                 _route_cache.update(data)
-                log.debug("Loaded %d route(s) from %s", len(_route_cache), _CACHE_PATH)
+                log.info("Loaded %d route(s) from %s", len(_route_cache), _CACHE_PATH)
     except Exception as exc:
         log.error("Cache load failed: %s", exc)
 
@@ -171,11 +171,13 @@ async def _post(url: str, method: str, params: dict, *, _retry: bool = True) -> 
     if url not in _session_ids:
         try:
             await _initialize(url)
-        except Exception as exc:
-            # Initialization failed (port unreachable or IDE not ready).
+        except (httpx.ConnectError, httpx.TimeoutException) as exc:
+            # Port unreachable — expected during startup probing of dead ports.
             # Do NOT mark url as initialized — allows re-init on the next call
             # so IDEs that start up after the router can be discovered later.
-            log.debug("initialize at %s failed: %s", url, exc)
+            log.debug("initialize at %s unreachable: %s", url, exc)
+        except Exception as exc:
+            log.warning("initialize at %s failed unexpectedly: %s", url, exc)
 
     payload = {"jsonrpc": "2.0", "id": _next_id(), "method": method, "params": params}
     try:
@@ -260,8 +262,11 @@ async def _project_paths_at(url: str) -> list[str]:
             except json.JSONDecodeError:
                 pass
         return paths
+    except ConnectionError as exc:
+        log.debug("get_repositories at %s unreachable: %s", url, exc)
+        return []
     except Exception as exc:
-        log.debug("get_repositories at %s failed: %s", url, exc)
+        log.warning("get_repositories at %s failed unexpectedly: %s", url, exc)
         return []
 
 
@@ -344,10 +349,13 @@ async def handle_list_tools() -> list[types.Tool]:
         try:
             result = await _post(url, "tools/list", {})
             tools = result.get("tools", [])
-            log.debug("Collected %d tools from port %d", len(tools), port)
+            log.info("Collected %d tools from port %d", len(tools), port)
             return tools
+        except ConnectionError as exc:
+            log.debug("tools/list at port %d unreachable: %s", port, exc)
+            return []
         except Exception as exc:
-            log.debug("tools/list at port %d failed: %s", port, exc)
+            log.warning("tools/list at port %d failed unexpectedly: %s", port, exc)
             return []
 
     all_results = await asyncio.gather(
@@ -371,7 +379,7 @@ async def handle_list_tools() -> list[types.Tool]:
             f"No JetBrains IDE found in ports {_PORT_START}–{_PORT_START + _PORT_COUNT - 1}. "
             "Start an IDE with MCP server enabled."
         )
-    log.debug("Returning %d tools (union of all responding IDEs)", len(seen))
+    log.info("Returning %d tools (union of all responding IDEs)", len(seen))
     return list(seen.values())
 
 
@@ -393,6 +401,7 @@ async def handle_call_tool(
     args["projectPath"] = resolved
 
     url = await _route(resolved)
+    log.info("tool=%s → %s (project: %s)", name, url, resolved)
     result = await _post(url, "tools/call", {"name": name, "arguments": args})
 
     items: list[types.TextContent | types.ImageContent | types.EmbeddedResource] = []
@@ -446,7 +455,7 @@ def main() -> None:
     log_file = os.environ.get("JBMCP_LOG_FILE", default_log_file)
     if log_file:
         file_handler = logging.FileHandler(log_file, encoding="utf-8")
-        file_handler.setLevel(logging.DEBUG)
+        file_handler.setLevel(logging.INFO)
         handlers.append(file_handler)
 
     # Root logger accepts everything; per-handler levels do the filtering.
