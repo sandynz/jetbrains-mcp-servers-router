@@ -178,6 +178,14 @@ async def _post(url: str, method: str, params: dict, *, _retry: bool = True) -> 
     payload = {"jsonrpc": "2.0", "id": _next_id(), "method": method, "params": params}
     try:
         resp = await _http.post(url, json=payload, headers=_build_headers(url))
+    except httpx.RemoteProtocolError as exc:
+        # Stale keepalive connection (IDE closed it while router was idle).
+        # httpx removes the dead connection from its pool; reinitialise and retry once.
+        if _retry:
+            log.debug("Stale connection to %s (%s); reinitialising and retrying", url, exc)
+            _session_ids.pop(url, None)
+            return await _post(url, method, params, _retry=False)
+        raise ConnectionError(f"IDE at {url} protocol error: {exc}") from exc
     except (httpx.ConnectError, httpx.TimeoutException) as exc:
         raise ConnectionError(f"IDE at {url} unreachable: {exc}") from exc
 
