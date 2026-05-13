@@ -24,8 +24,9 @@ JBMCP_PORT_COUNT       Number of ports      (default: 10)
 JBMCP_HOST             IDE host             (default: 127.0.0.1)
 JBMCP_CACHE            Cache file path      (default: ~/.jetbrains-mcp-router/cache.json)
 JBMCP_DEFAULT_PROJECT  Fallback project when no projectPath in args and CWD unknown
-JBMCP_DEBUG            Set to 1 for debug logging
-JBMCP_LOG_FILE         Optional path to a log file (logs go to stderr AND the file)
+JBMCP_DEBUG            Set to 1 to include DEBUG messages on stderr
+JBMCP_LOG_FILE         Log file path (default: ~/.jetbrains-mcp-router/router.log);
+                         set to empty string to disable file logging
 """
 
 from __future__ import annotations
@@ -84,7 +85,7 @@ def _load_cache() -> None:
                 _route_cache.update(data)
                 log.debug("Loaded %d route(s) from %s", len(_route_cache), _CACHE_PATH)
     except Exception as exc:
-        log.warning("Cache load failed: %s", exc)
+        log.error("Cache load failed: %s", exc)
 
 
 def _save_cache() -> None:
@@ -95,7 +96,7 @@ def _save_cache() -> None:
             encoding="utf-8",
         )
     except Exception as exc:
-        log.warning("Cache save failed: %s", exc)
+        log.error("Cache save failed: %s", exc)
 
 
 # ── HTTP client + MCP Streamable HTTP helpers ─────────────────────────────────
@@ -183,7 +184,7 @@ async def _post(url: str, method: str, params: dict, *, _retry: bool = True) -> 
         # Stale keepalive connection (IDE closed it while router was idle).
         # httpx removes the dead connection from its pool; reinitialise and retry once.
         if _retry:
-            log.debug("Stale connection to %s (%s); reinitialising and retrying", url, exc)
+            log.warning("Stale connection to %s (%s); reinitialising and retrying", url, exc)
             _session_ids.pop(url, None)
             return await _post(url, method, params, _retry=False)
         raise ConnectionError(f"IDE at {url} protocol error: {exc}") from exc
@@ -192,7 +193,7 @@ async def _post(url: str, method: str, params: dict, *, _retry: bool = True) -> 
 
     if resp.status_code == 404 and _retry:
         # Session expired (IDE restarted); reinitialise and retry once
-        log.info("Session at %s expired (404); reinitialising", url)
+        log.warning("Session at %s expired (404); reinitialising", url)
         _session_ids.pop(url, None)
         return await _post(url, method, params, _retry=False)
 
@@ -297,12 +298,12 @@ async def _route(project_path: str) -> str:
             current_paths = await _project_paths_at(url)
             if normalized in current_paths:
                 return url
-            log.info(
+            log.warning(
                 "IDE at %s no longer has project %s (port reassigned?); re-discovering",
                 url, normalized,
             )
         except Exception as exc:
-            log.info("Cached URL %s unreachable (%s); re-discovering", url, exc)
+            log.warning("Cached URL %s unreachable (%s); re-discovering", url, exc)
         del _route_cache[normalized]
         _session_ids.pop(url, None)
         _save_cache()
@@ -434,13 +435,22 @@ async def _run() -> None:
 
 
 def main() -> None:
-    level = logging.DEBUG if os.environ.get("JBMCP_DEBUG") else logging.WARNING
     fmt = "%(asctime)s %(levelname)s %(name)s: %(message)s"
-    handlers: list[logging.Handler] = [logging.StreamHandler(sys.stderr)]
-    log_file = os.environ.get("JBMCP_LOG_FILE")
+
+    stderr_level = logging.DEBUG if os.environ.get("JBMCP_DEBUG") else logging.WARNING
+    stderr_handler = logging.StreamHandler(sys.stderr)
+    stderr_handler.setLevel(stderr_level)
+    handlers: list[logging.Handler] = [stderr_handler]
+
+    default_log_file = str(_CACHE_PATH.parent / "router.log")
+    log_file = os.environ.get("JBMCP_LOG_FILE", default_log_file)
     if log_file:
-        handlers.append(logging.FileHandler(log_file, encoding="utf-8"))
-    logging.basicConfig(level=level, format=fmt, handlers=handlers)
+        file_handler = logging.FileHandler(log_file, encoding="utf-8")
+        file_handler.setLevel(logging.DEBUG)
+        handlers.append(file_handler)
+
+    # Root logger accepts everything; per-handler levels do the filtering.
+    logging.basicConfig(level=logging.DEBUG, format=fmt, handlers=handlers)
     asyncio.run(_run())
 
 
