@@ -304,33 +304,39 @@ server = Server("jetbrains-mcp-router")
 
 @server.list_tools()
 async def handle_list_tools() -> list[types.Tool]:
-    """Return the tool list from the first responding IDE.
+    """Return the union of tool lists from all responding IDEs.
 
-    All JetBrains IDEs share the same MCP tool schema, so one response is enough.
+    Different JetBrains IDEs expose IDE-specific tools (e.g. ``runNotebookCell``
+    in PyCharm, ``run_inspection_kts`` in RustRover). Returning the union ensures
+    the coding agent can see and invoke all available tools regardless of which
+    IDE happens to respond first.
     """
+    seen: dict[str, types.Tool] = {}  # name → Tool (first schema wins for duplicates)
     for port in range(_PORT_START, _PORT_START + _PORT_COUNT):
         url = _stream_url(port)
         try:
             result = await _post(url, "tools/list", {})
-            tools = [
-                types.Tool(
-                    name=t["name"],
-                    description=t.get("description", ""),
-                    inputSchema=t.get(
-                        "inputSchema", {"type": "object", "properties": {}}
-                    ),
-                )
-                for t in result.get("tools", [])
-            ]
-            log.debug("Listed %d tools from %s", len(tools), url)
-            return tools
+            for t in result.get("tools", []):
+                name = t["name"]
+                if name not in seen:
+                    seen[name] = types.Tool(
+                        name=name,
+                        description=t.get("description", ""),
+                        inputSchema=t.get(
+                            "inputSchema", {"type": "object", "properties": {}}
+                        ),
+                    )
+            log.debug("Collected tools from %s (total so far: %d)", url, len(seen))
         except Exception as exc:
             log.debug("tools/list at port %d failed: %s", port, exc)
 
-    raise RuntimeError(
-        f"No JetBrains IDE found in ports {_PORT_START}–{_PORT_START + _PORT_COUNT - 1}. "
-        "Start an IDE with MCP server enabled."
-    )
+    if not seen:
+        raise RuntimeError(
+            f"No JetBrains IDE found in ports {_PORT_START}–{_PORT_START + _PORT_COUNT - 1}. "
+            "Start an IDE with MCP server enabled."
+        )
+    log.debug("Returning %d tools (union of all responding IDEs)", len(seen))
+    return list(seen.values())
 
 
 @server.call_tool()
