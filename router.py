@@ -25,6 +25,7 @@ JBMCP_HOST             IDE host             (default: 127.0.0.1)
 JBMCP_CACHE            Cache file path      (default: ~/.jetbrains-mcp-router/cache.json)
 JBMCP_DEFAULT_PROJECT  Fallback project when no projectPath in args and CWD unknown
 JBMCP_DEBUG            Set to 1 for debug logging
+JBMCP_LOG_FILE         Optional path to a log file (logs go to stderr AND the file)
 """
 
 from __future__ import annotations
@@ -271,13 +272,18 @@ async def _route(project_path: str) -> str:
     if normalized in _route_cache:
         url = _route_cache[normalized]
         try:
-            await _post(url, "tools/list", {})
-            return url
-        except Exception:
-            log.info("Cached URL %s is stale for %s; re-discovering", url, normalized)
-            del _route_cache[normalized]
-            _session_ids.pop(url, None)
-            _save_cache()
+            current_paths = await _project_paths_at(url)
+            if normalized in current_paths:
+                return url
+            log.info(
+                "IDE at %s no longer has project %s (port reassigned?); re-discovering",
+                url, normalized,
+            )
+        except Exception as exc:
+            log.info("Cached URL %s unreachable (%s); re-discovering", url, exc)
+        del _route_cache[normalized]
+        _session_ids.pop(url, None)
+        _save_cache()
 
     url = await _discover_ide(normalized)
     if url is None:
@@ -387,11 +393,13 @@ async def _run() -> None:
 
 
 def main() -> None:
-    logging.basicConfig(
-        level=logging.DEBUG if os.environ.get("JBMCP_DEBUG") else logging.WARNING,
-        format="%(asctime)s %(levelname)s %(name)s: %(message)s",
-        stream=sys.stderr,
-    )
+    level = logging.DEBUG if os.environ.get("JBMCP_DEBUG") else logging.WARNING
+    fmt = "%(asctime)s %(levelname)s %(name)s: %(message)s"
+    handlers: list[logging.Handler] = [logging.StreamHandler(sys.stderr)]
+    log_file = os.environ.get("JBMCP_LOG_FILE")
+    if log_file:
+        handlers.append(logging.FileHandler(log_file, encoding="utf-8"))
+    logging.basicConfig(level=level, format=fmt, handlers=handlers)
     asyncio.run(_run())
 
 
