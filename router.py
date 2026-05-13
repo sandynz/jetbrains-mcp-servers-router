@@ -171,9 +171,10 @@ async def _post(url: str, method: str, params: dict, *, _retry: bool = True) -> 
         try:
             await _initialize(url)
         except Exception as exc:
-            # Proceed without session; server may be lenient
-            _session_ids[url] = ""
-            log.debug("initialize at %s failed (proceeding): %s", url, exc)
+            # Initialization failed (port unreachable or IDE not ready).
+            # Do NOT mark url as initialized — allows re-init on the next call
+            # so IDEs that start up after the router can be discovered later.
+            log.debug("initialize at %s failed: %s", url, exc)
 
     payload = {"jsonrpc": "2.0", "id": _next_id(), "method": method, "params": params}
     try:
