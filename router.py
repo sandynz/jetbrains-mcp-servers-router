@@ -299,16 +299,15 @@ async def _route(project_path: str) -> str:
 
     if normalized in _route_cache:
         url = _route_cache[normalized]
-        try:
-            current_paths = await _project_paths_at(url)
-            if normalized in current_paths:
-                return url
-            log.warning(
-                "IDE at %s no longer has project %s (port reassigned?); re-discovering",
-                url, normalized,
-            )
-        except Exception as exc:
-            log.warning("Cached URL %s unreachable (%s); re-discovering", url, exc)
+        # _project_paths_at never raises (it has full exception coverage); the call
+        # either returns a list of paths or returns [] if the IDE is unreachable.
+        current_paths = await _project_paths_at(url)
+        if normalized in current_paths:
+            return url
+        log.warning(
+            "IDE at %s no longer has project %s (port reassigned?); re-discovering",
+            url, normalized,
+        )
         del _route_cache[normalized]
         _session_ids.pop(url, None)
         _save_cache()

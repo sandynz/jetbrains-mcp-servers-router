@@ -5,7 +5,10 @@
 # ///
 """Unit tests for jetbrains-mcp-servers-router router.py internal logic."""
 
-import asyncio, json, sys, tempfile
+import asyncio
+import json
+import sys
+import tempfile
 from pathlib import Path
 from unittest.mock import AsyncMock
 
@@ -21,7 +24,8 @@ def _fake_path(name: str) -> str:
         return rf"C:\path\to\{name}"
     return f"/path/to/{name}"
 
-P = "\u2705"; F = "\u274c"
+P = "\u2705"
+F = "\u274c"
 
 def make_json_resp(result, status=200, session_id="", url="http://test"):
     body = json.dumps({"jsonrpc": "2.0", "id": 1, "result": result}).encode()
@@ -52,7 +56,8 @@ def make_mock(seq):
     """seq: list of httpx.Response or Exception instances, returned/raised in order."""
     box = [0]
     async def _side(*a, **kw):
-        i = box[0]; box[0] += 1
+        i = box[0]
+        box[0] += 1
         item = seq[i]
         if isinstance(item, BaseException):
             raise item
@@ -322,7 +327,6 @@ async def t10_cache_stale():
     # Port 9987: correct IDE, has our project; port 9988: stale IDE, has other project
     call_counts = {"9987": 0, "9988": 0}
     async def smart_post(target_url, **kw):
-        payload = kw.get("json", {})
         port = target_url.split(":")[2].split("/")[0]
         call_counts[port] = call_counts.get(port, 0) + 1
         if port == "9987":
@@ -352,6 +356,37 @@ async def t10_cache_stale():
         reset()
 
 
+# ── T12: _route raises RuntimeError when no IDE owns the project ──────────────
+async def t12_route_no_ide_found():
+    print("T12: _route raises RuntimeError when no IDE found")
+    reset()
+    project = _fake_path("orphan_project")
+
+    old_start = router._PORT_START
+    old_count = router._PORT_COUNT
+    router._PORT_START = 9970
+    router._PORT_COUNT = 2
+
+    async def all_dead(target_url, **kw):
+        raise httpx.ConnectError("refused", request=httpx.Request("POST", target_url))
+
+    mock = AsyncMock()
+    mock.post.side_effect = all_dead
+    router._http = mock
+
+    try:
+        try:
+            await router._route(project)
+            assert False, "should have raised RuntimeError"
+        except RuntimeError as e:
+            assert "No JetBrains IDE found" in str(e), str(e)
+            print(f"  {P} RuntimeError raised: 'No JetBrains IDE found'\n")
+    finally:
+        router._PORT_START = old_start
+        router._PORT_COUNT = old_count
+        reset()
+
+
 # ── Main ─────────────────────────────────────────────────────────────────────
 async def run():
     t1_extract_sse()
@@ -365,8 +400,9 @@ async def run():
     await t9_cache_hit()
     await t10_cache_stale()
     await t11_late_start_ide()
+    await t12_route_no_ide_found()
     print("=" * 55)
-    print("All 11 tests PASSED \u2705")
+    print("All 12 tests PASSED \u2705")
 
 if __name__ == "__main__":
     asyncio.run(run())
