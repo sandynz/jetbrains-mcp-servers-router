@@ -8,9 +8,9 @@ A single-file Python MCP server that routes tool calls to the correct JetBrains 
 
 ## Problem
 
-JetBrains IDEs (IntelliJ IDEA, PyCharm, RustRover, …) each expose a built-in MCP server on a different port. When you work on multiple projects simultaneously — each open in a different IDE — you need a way to tell your coding agent which MCP server to use for the current project.
+JetBrains IDEs (IntelliJ IDEA, PyCharm, RustRover, …) each expose a built-in MCP server, but the port is not fixed by IDE type. Each IDE instance automatically chooses from the candidate port range. When you work on multiple projects simultaneously, each project may be open in a different IDE, and your coding agent needs a way to know which MCP server owns the current project.
 
-Without this router you need one MCP entry per IDE in every coding agent configuration file.
+Most MCP tools exposed by JetBrains IDEs are shared, but individual IDEs may add a small number of IDE-specific tools (for example notebook tools in PyCharm or inspection tools in RustRover). Without this router you need one MCP entry per IDE in every coding agent configuration file, and you need to manage port and tool-list changes manually.
 
 ## Solution
 
@@ -54,6 +54,8 @@ uv run /path/to/jetbrains-mcp-servers-router/router.py
 ```
 
 Refer to your coding agent's documentation for the exact `/mcp add` syntax.
+
+If you start another JetBrains IDE during development, or an IDE restart changes its MCP port, run `/mcp reload` (or the equivalent operation in your coding agent) to refresh the MCP tool list.
 
 ## Environment Variables
 

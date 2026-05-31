@@ -8,9 +8,9 @@
 
 ## 背景
 
-JetBrains IDE（IntelliJ IDEA、PyCharm、RustRover 等）各自在不同端口上运行内置 MCP Server。同时开发多个项目时，每个项目在不同的 IDE 中打开，coding agent 需要知道应该使用哪个 MCP Server。
+JetBrains IDE（IntelliJ IDEA、PyCharm、RustRover 等）各自运行内置 MCP Server，但端口号并不是按 IDE 类型固定分配的，而是从候选端口中自动选择。同时开发多个项目时，每个项目可能在不同的 IDE 中打开，coding agent 需要知道应该使用哪个 MCP Server。
 
-没有路由器时，需要在每个 coding agent 的配置里为每个 IDE 单独配置一条 MCP 条目。
+各 JetBrains IDE 暴露的 MCP tool 大部分相同，但不同 IDE 仍可能提供少量专属工具（例如 PyCharm 的 notebook 相关工具、RustRover 的检查工具）。没有路由器时，需要在每个 coding agent 的配置里为每个 IDE 单独配置一条 MCP 条目，并手动处理端口和工具列表变化。
 
 ## 解决方案
 
@@ -54,6 +54,8 @@ uv run /path/to/jetbrains-mcp-servers-router/router.py
 ```
 
 具体的 `/mcp add` 语法请参考你所使用的 coding agent 文档。
+
+如果开发过程中额外启动了新的 JetBrains IDE，或者某个 IDE 重启后 MCP 端口发生变化，可以在 coding agent 中执行 `/mcp reload`（或等效操作）刷新 MCP tool 列表。
 
 ## 环境变量
 
