@@ -7,6 +7,7 @@
 
 import asyncio
 import json
+import os
 import sys
 import tempfile
 from pathlib import Path
@@ -122,6 +123,28 @@ def t3_cache():
         finally:
             router._CACHE_PATH = old
             reset()
+
+
+# ── T13: log file parent directory is created ────────────────────────────────
+def t13_log_file_parent_created():
+    print("T13: log file parent directory is created")
+    with tempfile.TemporaryDirectory() as tmp:
+        log_file = Path(tmp) / "nested" / "logs" / "router.log"
+        old = os.environ.get("JBMCP_LOG_FILE")
+        os.environ["JBMCP_LOG_FILE"] = str(log_file)
+        handlers = []
+        try:
+            handlers = router._make_log_handlers()
+            assert log_file.exists(), "FileHandler should create the log file"
+            assert log_file.parent.is_dir(), "log parent directory should be created"
+            print(f"  {P} created missing log directory before FileHandler\n")
+        finally:
+            for handler in handlers:
+                handler.close()
+            if old is None:
+                os.environ.pop("JBMCP_LOG_FILE", None)
+            else:
+                os.environ["JBMCP_LOG_FILE"] = old
 
 
 # ── T4: _post RemoteProtocolError → retry once, succeed ──────────────────────
@@ -392,6 +415,7 @@ async def run():
     t1_extract_sse()
     t2_norm()
     t3_cache()
+    t13_log_file_parent_created()
     await t4_stale_retry()
     await t5_404_retry()
     await t6_no_infinite_retry()
@@ -402,7 +426,7 @@ async def run():
     await t11_late_start_ide()
     await t12_route_no_ide_found()
     print("=" * 55)
-    print("All 12 tests PASSED \u2705")
+    print("All 13 tests PASSED \u2705")
 
 if __name__ == "__main__":
     asyncio.run(run())

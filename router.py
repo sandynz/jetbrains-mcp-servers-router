@@ -442,9 +442,7 @@ async def _run() -> None:
         await _http.aclose()
 
 
-def main() -> None:
-    fmt = "%(asctime)s %(levelname)s %(name)s: %(message)s"
-
+def _make_log_handlers() -> list[logging.Handler]:
     stderr_level = logging.DEBUG if os.environ.get("JBMCP_DEBUG") else logging.WARNING
     stderr_handler = logging.StreamHandler(sys.stderr)
     stderr_handler.setLevel(stderr_level)
@@ -453,9 +451,17 @@ def main() -> None:
     default_log_file = str(_CACHE_PATH.parent / "router.log")
     log_file = os.environ.get("JBMCP_LOG_FILE", default_log_file)
     if log_file:
+        Path(log_file).parent.mkdir(parents=True, exist_ok=True)
         file_handler = logging.FileHandler(log_file, encoding="utf-8")
         file_handler.setLevel(logging.INFO)
         handlers.append(file_handler)
+
+    return handlers
+
+
+def main() -> None:
+    fmt = "%(asctime)s %(levelname)s %(name)s: %(message)s"
+    handlers = _make_log_handlers()
 
     # Root logger accepts everything; per-handler levels do the filtering.
     logging.basicConfig(level=logging.DEBUG, format=fmt, handlers=handlers)
