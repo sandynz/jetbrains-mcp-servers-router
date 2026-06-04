@@ -358,7 +358,8 @@ async def t9_cache_hit():
     router._session_ids[url] = "s1"  # already initialized
 
     ide_result = {
-        "structuredContent": {"projects": [{"path": project}]}
+        "isError": False,
+        "structuredContent": {"roots": [{"pathRelativeToProject": ""}]},
     }
     seq = [make_json_resp(ide_result)]  # only 1 call: get_repositories for validation
     mock, box = make_mock(seq)
@@ -366,8 +367,10 @@ async def t9_cache_hit():
 
     result_url = await router._route(project)
     assert result_url == url
+    sent_params = mock.post.call_args_list[0].kwargs["json"]["params"]
+    assert sent_params["arguments"]["projectPath"] == norm
     assert box[0] == 1, f"expected 1 HTTP call (validation only), got {box[0]}"
-    print(f"  {P} returned cached URL without re-discovery\n")
+    print(f"  {P} validated cached URL by passing projectPath to get_repositories\n")
 
 
 # ── T10: _route cache stale -> re-discovers correct IDE ──────────────────────
@@ -382,8 +385,20 @@ async def t10_cache_stale():
     router._route_cache[norm] = stale_url
     router._session_ids[stale_url] = "stale-s"
 
-    # Cache validation: stale_url's get_repositories returns OTHER project
-    stale_result = {"structuredContent": {"projects": [{"path": _fake_path("other_project")}]}}
+    # Cache validation: stale_url rejects the requested projectPath.
+    open_projects = json.dumps({"projects": [{"path": _fake_path("other_project")}]})
+    stale_result = {
+        "isError": True,
+        "content": [
+            {
+                "type": "text",
+                "text": (
+                    f"`projectPath`=`{project}` doesn't correspond to any open project.\n"
+                    f"Currently open projects: {open_projects}"
+                ),
+            }
+        ],
+    }
 
     # _discover_ide probes _PORT_COUNT ports; we override them to use only 2 ports for speed
     old_start = router._PORT_START
@@ -391,7 +406,7 @@ async def t10_cache_stale():
     router._PORT_START = 9987
     router._PORT_COUNT = 2
 
-    # Port 9987: correct IDE, has our project; port 9988: stale IDE, has other project
+    # Port 9987: correct IDE accepts the projectPath; port 9988 rejects it.
     call_counts = {"9987": 0, "9988": 0}
     async def smart_post(target_url, **kw):
         port = target_url.split(":")[2].split("/")[0]
@@ -403,9 +418,14 @@ async def t10_cache_stale():
             elif call_counts["9987"] == 2:
                 return make_notif_resp()
             else:
-                return make_json_resp({"structuredContent": {"projects": [{"path": project}]}})
+                return make_json_resp(
+                    {
+                        "isError": False,
+                        "structuredContent": {"roots": [{"pathRelativeToProject": ""}]},
+                    }
+                )
         elif port == "9988":
-            # Validation call (session already set)
+            # Validation and discovery calls both reject the target projectPath.
             return make_json_resp(stale_result)
 
     mock_client = AsyncMock()

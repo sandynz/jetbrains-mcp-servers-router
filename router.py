@@ -402,6 +402,23 @@ def _parse_project_paths_json(text: str) -> Any:
         return None
 
 
+def _project_paths_from_result(result: dict[str, Any]) -> list[str]:
+    paths: list[str] = []
+
+    struct = result.get("structuredContent") or {}
+    if "projects" in struct:
+        _append_project_paths(paths, struct)
+        return paths
+
+    for item in result.get("content", []):
+        if item.get("type") != "text":
+            continue
+        data = _parse_project_paths_json(item["text"])
+        if data is not None:
+            _append_project_paths(paths, data)
+    return paths
+
+
 async def _project_paths_at(url: str) -> list[str]:
     """Return normalised project paths open in the IDE at ``url``, or [] on failure.
 
@@ -412,22 +429,7 @@ async def _project_paths_at(url: str) -> list[str]:
     """
     try:
         result = await _post(url, "tools/call", {"name": "get_repositories", "arguments": {}})
-        paths: list[str] = []
-
-        # Primary: structuredContent.projects (reliable structured data)
-        struct = result.get("structuredContent") or {}
-        if "projects" in struct:
-            _append_project_paths(paths, struct)
-            return paths
-
-        # Fallback: parse content[0].text as JSON or as a message with embedded JSON.
-        for item in result.get("content", []):
-            if item.get("type") != "text":
-                continue
-            data = _parse_project_paths_json(item["text"])
-            if data is not None:
-                _append_project_paths(paths, data)
-        return paths
+        return _project_paths_from_result(result)
     except (ConnectionError, TimeoutError) as exc:
         log.debug("get_repositories at %s unreachable: %s", url, exc)
         return []
@@ -436,14 +438,40 @@ async def _project_paths_at(url: str) -> list[str]:
         return []
 
 
+async def _project_matches_at(url: str, project_path: str) -> bool:
+    """Return whether the IDE at ``url`` accepts ``projectPath`` as an open project."""
+    try:
+        result = await _post(
+            url,
+            "tools/call",
+            {"name": "get_repositories", "arguments": {"projectPath": project_path}},
+        )
+        if result.get("isError") is True:
+            open_projects = _project_paths_from_result(result)
+            if open_projects:
+                log.debug(
+                    "IDE at %s rejected project %s; open projects: %s",
+                    url,
+                    project_path,
+                    open_projects,
+                )
+            return False
+        return True
+    except (ConnectionError, TimeoutError) as exc:
+        log.debug("get_repositories at %s unreachable: %s", url, exc)
+        return False
+    except Exception as exc:
+        log.warning("get_repositories at %s failed unexpectedly: %s", url, exc)
+        return False
+
+
 async def _discover_ide(project_path: str) -> str | None:
     """Concurrently probe all candidate ports; return the URL that owns the project."""
     normalized = _norm(project_path)
 
     async def probe(port: int) -> tuple[str, bool]:
         url = _stream_url(port)
-        paths = await _project_paths_at(url)
-        return url, normalized in paths
+        return url, await _project_matches_at(url, normalized)
 
     results = await asyncio.gather(
         *(probe(p) for p in range(_PORT_START, _PORT_START + _PORT_COUNT)),
@@ -465,10 +493,7 @@ async def _route(project_path: str) -> str:
 
     if normalized in _route_cache:
         url = _route_cache[normalized]
-        # _project_paths_at never raises (it has full exception coverage); the call
-        # either returns a list of paths or returns [] if the IDE is unreachable.
-        current_paths = await _project_paths_at(url)
-        if normalized in current_paths:
+        if await _project_matches_at(url, normalized):
             return url
         log.warning(
             "IDE at %s no longer has project %s (port reassigned?); re-discovering",
