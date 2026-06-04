@@ -314,6 +314,38 @@ async def t8_structured_content():
     print(f"  {P} extracted {len(paths)} paths, both present\n")
 
 
+# ── T19: _project_paths_at parses embedded Currently open projects JSON ──────
+async def t19_embedded_open_projects_text():
+    print("T19: _project_paths_at parses embedded Currently open projects JSON")
+    reset()
+    url = "http://127.0.0.1:9979/stream"
+    project_a = _fake_path("project_a")
+    project_b = _fake_path("project_b")
+    open_projects = json.dumps(
+        {"projects": [{"path": project_a}, {"path": project_b}]}
+    )
+    ide_result = {
+        "isError": True,
+        "content": [
+            {
+                "type": "text",
+                "text": (
+                    "Unable to determine the target project for the current MCP tool call.\n"
+                    f"Currently open projects: {open_projects}"
+                ),
+            }
+        ],
+    }
+    seq = [*init_seq(), make_json_resp(ide_result)]
+    mock, _ = make_mock(seq)
+    router._http = mock
+
+    paths = await router._project_paths_at(url)
+    assert router._norm(project_a) in paths
+    assert router._norm(project_b) in paths
+    print(f"  {P} extracted {len(paths)} embedded paths, both present\n")
+
+
 # ── T9: _route cache-hit validation success (no re-discovery) ─────────────────
 async def t9_cache_hit():
     print("T9: _route cache hit -> validation passes -> no re-discovery")
@@ -588,6 +620,7 @@ async def run():
     await t6_no_infinite_retry()
     await t7_dead_port()
     await t8_structured_content()
+    await t19_embedded_open_projects_text()
     await t9_cache_hit()
     await t10_cache_stale()
     await t11_late_start_ide()
@@ -598,7 +631,7 @@ async def run():
     await t17_ambiguous_timeout_uses_default()
     await t18_zero_tool_timeout()
     print("=" * 55)
-    print("All 18 tests PASSED \u2705")
+    print("All 19 tests PASSED \u2705")
 
 if __name__ == "__main__":
     asyncio.run(run())

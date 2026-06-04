@@ -363,13 +363,52 @@ async def _post(
 # ── IDE discovery ─────────────────────────────────────────────────────────────
 
 
+def _append_project_path(paths: list[str], repo: Any) -> None:
+    if not isinstance(repo, dict):
+        return
+    path = repo.get("path") or repo.get("projectPath") or repo.get("rootPath") or ""
+    if path:
+        paths.append(_norm(path))
+
+
+def _append_project_paths(paths: list[str], data: Any) -> None:
+    if isinstance(data, dict) and isinstance(data.get("projects"), list):
+        repos = data["projects"]
+    elif isinstance(data, list):
+        repos = data
+    else:
+        repos = [data]
+    for repo in repos:
+        _append_project_path(paths, repo)
+
+
+def _parse_project_paths_json(text: str) -> Any:
+    try:
+        return json.loads(text)
+    except json.JSONDecodeError:
+        pass
+
+    marker = "Currently open projects:"
+    marker_index = text.find(marker)
+    if marker_index < 0:
+        return None
+    fragment = text[marker_index + len(marker):].strip()
+    if not fragment:
+        return None
+    try:
+        data, _ = json.JSONDecoder().raw_decode(fragment)
+        return data
+    except json.JSONDecodeError:
+        return None
+
+
 async def _project_paths_at(url: str) -> list[str]:
     """Return normalised project paths open in the IDE at ``url``, or [] on failure.
 
     When ``get_repositories`` is called without ``projectPath`` the IDE returns
-    ``isError: true`` but still embeds the open-project list in ``structuredContent``,
-    which is the authoritative source. The ``content[0].text`` fallback exists for
-    future IDE versions that may change the response format.
+    ``isError: true`` but still reports the open-project list. Newer IDE builds may
+    use ``structuredContent.projects``; some builds embed the same JSON after the
+    ``Currently open projects:`` marker in ``content[0].text``.
     """
     try:
         result = await _post(url, "tools/call", {"name": "get_repositories", "arguments": {}})
@@ -378,31 +417,16 @@ async def _project_paths_at(url: str) -> list[str]:
         # Primary: structuredContent.projects (reliable structured data)
         struct = result.get("structuredContent") or {}
         if "projects" in struct:
-            for repo in struct["projects"]:
-                p = repo.get("path") or ""
-                if p:
-                    paths.append(_norm(p))
+            _append_project_paths(paths, struct)
             return paths
 
-        # Fallback: parse content[0].text as JSON
+        # Fallback: parse content[0].text as JSON or as a message with embedded JSON.
         for item in result.get("content", []):
             if item.get("type") != "text":
                 continue
-            text: str = item["text"]
-            try:
-                data = json.loads(text)
-                repos = data if isinstance(data, list) else [data]
-                for repo in repos:
-                    p = (
-                        repo.get("path")
-                        or repo.get("projectPath")
-                        or repo.get("rootPath")
-                        or ""
-                    )
-                    if p:
-                        paths.append(_norm(p))
-            except json.JSONDecodeError:
-                pass
+            data = _parse_project_paths_json(item["text"])
+            if data is not None:
+                _append_project_paths(paths, data)
         return paths
     except (ConnectionError, TimeoutError) as exc:
         log.debug("get_repositories at %s unreachable: %s", url, exc)
