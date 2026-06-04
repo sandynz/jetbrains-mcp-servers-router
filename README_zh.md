@@ -23,6 +23,8 @@ JetBrains IDE（IntelliJ IDEA、PyCharm、RustRover 等）各自运行内置 MCP
 
 路由器返回所有已连接 IDE 工具列表的**并集**，因此各 IDE 的专属工具（如 PyCharm 的 `runNotebookCell`、RustRover 的 `run_inspection_kts`）全部对 coding agent 可见。
 
+路由器位于 coding agent 和 JetBrains IDE 之间，会使用自己的 HTTP client 转发到 IDE 的 `/stream`。如果直接调用 IDE 的 `/stream`，超时行为由调用方 MCP 客户端决定；通过本路由器调用时，还会受到路由器侧 HTTP read timeout 的影响，因此长耗时工具需要支持按次覆盖。
+
 ## 环境要求
 
 - Python 3.11+
@@ -66,8 +68,27 @@ uv run /path/to/jetbrains-mcp-servers-router/router.py
 | `JBMCP_HOST` | `127.0.0.1` | IDE 主机地址 |
 | `JBMCP_CACHE` | `~/.jetbrains-mcp-router/cache.json` | 路由缓存文件路径 |
 | `JBMCP_DEFAULT_PROJECT` | — | CWD 未知时的兜底项目路径 |
+| `JBMCP_CONNECT_TIMEOUT` | `1.5` | HTTP 连接超时时间，单位秒 |
+| `JBMCP_READ_TIMEOUT` | `60` | 默认 HTTP 读取超时时间，单位秒；设为 `0`、`none`、`off` 或 `disabled` 可禁用 |
+| `JBMCP_WRITE_TIMEOUT` | `10` | HTTP 写入超时时间，单位秒 |
+| `JBMCP_POOL_TIMEOUT` | `5` | HTTP 连接池超时时间，单位秒 |
+| `JBMCP_TIMEOUT_GRACE` | `5` | 从 tool 的 `timeout` 参数推导 router timeout 时额外增加的秒数 |
 | `JBMCP_DEBUG` | — | 设为 `1` 开启 debug 日志 |
 | `JBMCP_LOG_FILE` | — | 可选日志文件路径（同时写入 stderr 和文件） |
+
+## Router Timeout
+
+路由器不会给 JetBrains tool schema 添加 router 私有参数。
+
+当 JetBrains tool schema 本身包含数字类型的 `timeout` 参数，并且描述明确说明单位是毫秒时，路由器会从这个原生 tool 参数推导 HTTP read timeout：
+
+```text
+router_read_timeout_seconds = timeout_milliseconds / 1000 + JBMCP_TIMEOUT_GRACE
+```
+
+例如 `execute_run_configuration(timeout=1200000)` 会让 router read timeout 使用 `1200 + grace` 秒，同时原始 `timeout=1200000` 会原样转发给 JetBrains IDE tool。
+
+如果未来 JetBrains 新增 tool，并且它的 `timeout` 参数单位或语义不清，路由器会写 warning 日志，并继续使用默认的 `JBMCP_READ_TIMEOUT`，不会用这个字段推导 read timeout。
 
 ## 路由机制
 

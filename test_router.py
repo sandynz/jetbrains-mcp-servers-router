@@ -48,9 +48,16 @@ def make_notif_resp(url="http://test"):
     r.request = httpx.Request("POST", url)
     return r
 
+
+def make_tool_resp(text="ok", url="http://test"):
+    return make_json_resp({"content": [{"type": "text", "text": text}]}, url=url)
+
+
 def reset():
     router._route_cache.clear()
     router._session_ids.clear()
+    router._millisecond_timeout_tools.clear()
+    router._ambiguous_timeout_tools.clear()
     router._req_id = 0
 
 def make_mock(seq):
@@ -69,6 +76,11 @@ def make_mock(seq):
 
 def req(port=9999):
     return httpx.Request("POST", f"http://127.0.0.1:{port}/stream")
+
+
+def assert_read_timeout(timeout, expected):
+    actual = timeout.as_dict()["read"]
+    assert actual == expected, f"expected read timeout {expected}, got {actual}"
 
 # Init sequence helper: [initialize-resp, notif-resp]
 def init_seq(session_id="s1"):
@@ -410,6 +422,161 @@ async def t12_route_no_ide_found():
         reset()
 
 
+# ── T14: timeout schema classification ───────────────────────────────────────
+def t14_timeout_schema_classification():
+    print("T14: timeout schema classification")
+    safe_schema = {
+        "type": "object",
+        "properties": {"timeout": {"type": "integer", "description": "Timeout in milliseconds"}},
+    }
+    ambiguous_schema = {
+        "type": "object",
+        "properties": {"timeout": {"type": "integer", "description": "Retry timeout count"}},
+    }
+    no_timeout_schema = {"type": "object", "properties": {"projectPath": {"type": "string"}}}
+
+    assert router._has_millisecond_timeout(safe_schema) is True
+    assert router._has_millisecond_timeout(ambiguous_schema) is False
+    assert router._has_millisecond_timeout(no_timeout_schema) is None
+    print(f"  {P} detects millisecond, ambiguous, and absent timeout schemas\n")
+
+
+# ── T15: tool list records timeout semantics without schema pollution ────────
+async def t15_tool_list_records_timeout_semantics():
+    print("T15: tool list records timeout semantics without schema pollution")
+    reset()
+    old_start = router._PORT_START
+    old_count = router._PORT_COUNT
+    router._PORT_START = 9969
+    router._PORT_COUNT = 1
+    tool_schema = {
+        "type": "object",
+        "properties": {"timeout": {"type": "integer", "description": "Timeout in milliseconds"}},
+    }
+    result = {"tools": [{"name": "execute_run_configuration", "inputSchema": tool_schema}]}
+    seq = [*init_seq(), make_json_resp(result)]
+    mock, _ = make_mock(seq)
+    router._http = mock
+
+    try:
+        tools = await router.handle_list_tools()
+        assert "execute_run_configuration" in router._millisecond_timeout_tools
+        assert "execute_run_configuration" not in router._ambiguous_timeout_tools
+        assert tools[0].inputSchema == tool_schema
+        assert list(tools[0].inputSchema["properties"]) == ["timeout"]
+        print(f"  {P} records millisecond timeout and leaves IDE schema unchanged\n")
+    finally:
+        router._PORT_START = old_start
+        router._PORT_COUNT = old_count
+        reset()
+
+
+# ── T16: existing tool timeout drives router read timeout ───────────────────
+async def t16_tool_timeout_drives_router_timeout():
+    print("T16: existing tool timeout drives router read timeout")
+    reset()
+    url = "http://127.0.0.1:9968/stream"
+    router._session_ids[url] = "s1"
+    router._millisecond_timeout_tools.add("execute_run_configuration")
+    old_route = router._route
+    calls = []
+
+    async def fake_route(_project_path):
+        return url
+
+    async def smart_post(target_url, **kw):
+        calls.append((target_url, kw))
+        return make_tool_resp(url=target_url)
+
+    mock = AsyncMock()
+    mock.post.side_effect = smart_post
+    router._http = mock
+    router._route = fake_route
+
+    try:
+        await router.handle_call_tool(
+            "execute_run_configuration",
+            {"projectPath": _fake_path("project_a"), "timeout": 120000},
+        )
+        sent_args = calls[0][1]["json"]["params"]["arguments"]
+        assert sent_args["timeout"] == 120000
+        assert_read_timeout(calls[0][1]["timeout"], 125.0)
+        print(f"  {P} tool timeout forwarded and router read timeout includes grace\n")
+    finally:
+        router._route = old_route
+        reset()
+
+
+# ── T17: ambiguous timeout keeps default router timeout ──────────────────────
+async def t17_ambiguous_timeout_uses_default():
+    print("T17: ambiguous timeout keeps default router timeout")
+    reset()
+    url = "http://127.0.0.1:9967/stream"
+    router._session_ids[url] = "s1"
+    router._ambiguous_timeout_tools.add("future_tool")
+    old_route = router._route
+    calls = []
+
+    async def fake_route(_project_path):
+        return url
+
+    async def smart_post(target_url, **kw):
+        calls.append((target_url, kw))
+        return make_tool_resp(url=target_url)
+
+    mock = AsyncMock()
+    mock.post.side_effect = smart_post
+    router._http = mock
+    router._route = fake_route
+
+    try:
+        await router.handle_call_tool(
+            "future_tool",
+            {"projectPath": _fake_path("project_a"), "timeout": 120000},
+        )
+        assert_read_timeout(calls[0][1]["timeout"], router._READ_TIMEOUT_SECONDS)
+        print(f"  {P} ambiguous timeout did not override router default\n")
+    finally:
+        router._route = old_route
+        reset()
+
+
+# ── T18: zero tool timeout disables router read timeout ──────────────────────
+async def t18_zero_tool_timeout():
+    print("T18: zero tool timeout disables router read timeout")
+    reset()
+    url = "http://127.0.0.1:9966/stream"
+    router._session_ids[url] = "s1"
+    router._millisecond_timeout_tools.add("execute_run_configuration")
+    old_route = router._route
+    calls = []
+
+    async def fake_route(_project_path):
+        return url
+
+    async def smart_post(target_url, **kw):
+        calls.append((target_url, kw))
+        return make_tool_resp(url=target_url)
+
+    mock = AsyncMock()
+    mock.post.side_effect = smart_post
+    router._http = mock
+    router._route = fake_route
+
+    try:
+        await router.handle_call_tool(
+            "execute_run_configuration",
+            {"projectPath": _fake_path("project_a"), "timeout": 0},
+        )
+        sent_args = calls[0][1]["json"]["params"]["arguments"]
+        assert sent_args["timeout"] == 0
+        assert_read_timeout(calls[0][1]["timeout"], None)
+        print(f"  {P} timeout=0 forwarded and router read timeout disabled\n")
+    finally:
+        router._route = old_route
+        reset()
+
+
 # ── Main ─────────────────────────────────────────────────────────────────────
 async def run():
     t1_extract_sse()
@@ -425,8 +592,13 @@ async def run():
     await t10_cache_stale()
     await t11_late_start_ide()
     await t12_route_no_ide_found()
+    t14_timeout_schema_classification()
+    await t15_tool_list_records_timeout_semantics()
+    await t16_tool_timeout_drives_router_timeout()
+    await t17_ambiguous_timeout_uses_default()
+    await t18_zero_tool_timeout()
     print("=" * 55)
-    print("All 13 tests PASSED \u2705")
+    print("All 18 tests PASSED \u2705")
 
 if __name__ == "__main__":
     asyncio.run(run())

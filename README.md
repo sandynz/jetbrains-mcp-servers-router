@@ -23,6 +23,8 @@ The router exposes a **single stdio MCP endpoint**. On every tool call it:
 
 The **union** of all connected IDEs' tool lists is returned, so IDE-specific tools (e.g. `runNotebookCell` in PyCharm, `run_inspection_kts` in RustRover) are all visible to the coding agent.
 
+The router uses its own HTTP client between the coding agent and the JetBrains IDE. Calling an IDE's `/stream` endpoint directly uses the caller's MCP timeout behavior. Calling through this router also needs a router-side HTTP read timeout, so long-running tools can override it per call.
+
 ## Requirements
 
 - Python 3.11+
@@ -66,8 +68,27 @@ If you start another JetBrains IDE during development, or an IDE restart changes
 | `JBMCP_HOST` | `127.0.0.1` | IDE host |
 | `JBMCP_CACHE` | `~/.jetbrains-mcp-router/cache.json` | Route cache file path |
 | `JBMCP_DEFAULT_PROJECT` | — | Fallback project path when CWD is unknown |
+| `JBMCP_CONNECT_TIMEOUT` | `1.5` | HTTP connect timeout in seconds |
+| `JBMCP_READ_TIMEOUT` | `60` | Default HTTP read timeout in seconds; set to `0`, `none`, `off`, or `disabled` to disable |
+| `JBMCP_WRITE_TIMEOUT` | `10` | HTTP write timeout in seconds |
+| `JBMCP_POOL_TIMEOUT` | `5` | HTTP connection-pool timeout in seconds |
+| `JBMCP_TIMEOUT_GRACE` | `5` | Extra seconds added when deriving router timeout from a tool's `timeout` argument |
 | `JBMCP_DEBUG` | — | Set to `1` to enable debug logging |
 | `JBMCP_LOG_FILE` | — | Optional log file path (logs go to stderr **and** the file) |
+
+## Router Timeout
+
+The router does not add router-specific arguments to JetBrains tool schemas.
+
+When a JetBrains tool schema has a numeric `timeout` argument whose description clearly says it is measured in milliseconds, the router derives its HTTP read timeout from that original tool argument:
+
+```text
+router_read_timeout_seconds = timeout_milliseconds / 1000 + JBMCP_TIMEOUT_GRACE
+```
+
+For example, `execute_run_configuration(timeout=1200000)` gives the router a read timeout of `1200 + grace` seconds while forwarding the original `timeout=1200000` unchanged to the JetBrains IDE tool.
+
+If a future JetBrains tool adds a `timeout` argument with unclear units or semantics, the router logs a warning and keeps using the default `JBMCP_READ_TIMEOUT` instead of deriving a read timeout from it.
 
 ## How Routing Works
 

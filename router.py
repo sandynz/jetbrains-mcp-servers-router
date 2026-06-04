@@ -24,6 +24,12 @@ JBMCP_PORT_COUNT       Number of ports      (default: 10)
 JBMCP_HOST             IDE host             (default: 127.0.0.1)
 JBMCP_CACHE            Cache file path      (default: ~/.jetbrains-mcp-router/cache.json)
 JBMCP_DEFAULT_PROJECT  Fallback project when no projectPath in args and CWD unknown
+JBMCP_CONNECT_TIMEOUT  HTTP connect timeout in seconds (default: 1.5)
+JBMCP_READ_TIMEOUT     HTTP read timeout in seconds; 0/none disables it (default: 60)
+JBMCP_WRITE_TIMEOUT    HTTP write timeout in seconds (default: 10)
+JBMCP_POOL_TIMEOUT     HTTP pool timeout in seconds (default: 5)
+JBMCP_TIMEOUT_GRACE    Extra seconds added when deriving router timeout from tool timeout
+                         (default: 5)
 JBMCP_DEBUG            Set to 1 to include DEBUG messages on stderr
 JBMCP_LOG_FILE         Log file path (default: ~/.jetbrains-mcp-router/router.log);
                          set to empty string to disable file logging
@@ -57,6 +63,42 @@ _CACHE_PATH = Path(
         str(Path.home() / ".jetbrains-mcp-router" / "cache.json"),
     )
 )
+_TIMEOUT_UNSET = object()
+
+
+def _float_env(name: str, default: float) -> float:
+    raw = os.environ.get(name)
+    if raw is None or raw == "":
+        return default
+    try:
+        value = float(raw)
+    except ValueError as exc:
+        raise ValueError(f"{name} must be a number, got {raw!r}") from exc
+    if value <= 0:
+        raise ValueError(f"{name} must be greater than 0, got {raw!r}")
+    return value
+
+
+def _optional_float_env(name: str, default: float | None) -> float | None:
+    raw = os.environ.get(name)
+    if raw is None or raw == "":
+        return default
+    if raw.lower() in {"0", "none", "null", "off", "disabled"}:
+        return None
+    try:
+        value = float(raw)
+    except ValueError as exc:
+        raise ValueError(f"{name} must be a number or 'none', got {raw!r}") from exc
+    if value <= 0:
+        return None
+    return value
+
+
+_CONNECT_TIMEOUT_SECONDS = _float_env("JBMCP_CONNECT_TIMEOUT", 1.5)
+_READ_TIMEOUT_SECONDS = _optional_float_env("JBMCP_READ_TIMEOUT", 60.0)
+_WRITE_TIMEOUT_SECONDS = _float_env("JBMCP_WRITE_TIMEOUT", 10.0)
+_POOL_TIMEOUT_SECONDS = _float_env("JBMCP_POOL_TIMEOUT", 5.0)
+_TIMEOUT_GRACE_SECONDS = _optional_float_env("JBMCP_TIMEOUT_GRACE", 5.0) or 0.0
 
 
 def _stream_url(port: int) -> str:
@@ -104,6 +146,8 @@ def _save_cache() -> None:
 _http: httpx.AsyncClient  # initialised in _run()
 _req_id = 0
 _session_ids: dict[str, str] = {}  # IDE URL → Mcp-Session-Id (empty string = none)
+_millisecond_timeout_tools: set[str] = set()
+_ambiguous_timeout_tools: set[str] = set()
 
 
 def _next_id() -> int:
@@ -137,6 +181,90 @@ def _build_headers(url: str) -> dict[str, str]:
     return headers
 
 
+def _timeout(read_timeout: float | None | object = _TIMEOUT_UNSET) -> httpx.Timeout:
+    resolved_read_timeout = (
+        _READ_TIMEOUT_SECONDS if read_timeout is _TIMEOUT_UNSET else read_timeout
+    )
+    return httpx.Timeout(
+        connect=_CONNECT_TIMEOUT_SECONDS,
+        read=resolved_read_timeout,
+        write=_WRITE_TIMEOUT_SECONDS,
+        pool=_POOL_TIMEOUT_SECONDS,
+    )
+
+
+def _milliseconds_to_seconds(value: Any, name: str) -> float | None:
+    if type(value) not in (int, float):
+        raise ValueError(f"{name} must be a number of milliseconds, got {value!r}")
+    if value <= 0:
+        return None
+    return float(value) / 1000.0
+
+
+def _has_millisecond_timeout(schema: dict[str, Any]) -> bool | None:
+    properties = schema.get("properties")
+    if not isinstance(properties, dict) or "timeout" not in properties:
+        return None
+    timeout_schema = properties["timeout"]
+    if not isinstance(timeout_schema, dict):
+        return False
+    timeout_type = timeout_schema.get("type")
+    description = str(timeout_schema.get("description", "")).lower()
+    has_numeric_type = timeout_type in {"integer", "number"}
+    mentions_milliseconds = any(
+        keyword in description for keyword in ("milliseconds", "millisecond", " ms")
+    )
+    return has_numeric_type and mentions_milliseconds
+
+
+def _remember_tool_timeout_semantics(name: str, schema: dict[str, Any]) -> None:
+    has_millisecond_timeout = _has_millisecond_timeout(schema)
+    if has_millisecond_timeout is None:
+        return
+    if has_millisecond_timeout:
+        if name not in _ambiguous_timeout_tools:
+            _millisecond_timeout_tools.add(name)
+        return
+    _millisecond_timeout_tools.discard(name)
+    if name not in _ambiguous_timeout_tools:
+        log.warning(
+            "Tool %s has a timeout argument with unclear semantics; "
+            "router will not derive HTTP read timeout from it. schema=%s",
+            name,
+            json.dumps(schema.get("properties", {}).get("timeout"), ensure_ascii=False),
+        )
+    _ambiguous_timeout_tools.add(name)
+
+
+def _resolve_tool_read_timeout(name: str, args: dict[str, Any]) -> float | None | object:
+    if type(args.get("timeout")) not in (int, float):
+        return _TIMEOUT_UNSET
+    if name in _ambiguous_timeout_tools:
+        log.warning(
+            "Tool %s timeout argument is not known to be milliseconds; "
+            "using default router HTTP read timeout",
+            name,
+        )
+        return _TIMEOUT_UNSET
+    if name not in _millisecond_timeout_tools:
+        log.warning(
+            "Tool %s provided timeout before its schema was classified; "
+            "using default router HTTP read timeout",
+            name,
+        )
+        return _TIMEOUT_UNSET
+    tool_timeout = _milliseconds_to_seconds(args["timeout"], "timeout")
+    if tool_timeout is None:
+        return None
+    return tool_timeout + _TIMEOUT_GRACE_SECONDS
+
+
+def _tool_schema(schema: dict[str, Any]) -> dict[str, Any]:
+    if isinstance(schema, dict):
+        return schema
+    return {"type": "object", "properties": {}}
+
+
 async def _initialize(url: str) -> None:
     """Run MCP initialize + initialized handshake; cache session ID if provided."""
     payload = {
@@ -166,7 +294,14 @@ async def _initialize(url: str) -> None:
         pass
 
 
-async def _post(url: str, method: str, params: dict, *, _retry: bool = True) -> dict:
+async def _post(
+    url: str,
+    method: str,
+    params: dict,
+    *,
+    read_timeout: float | None | object = _TIMEOUT_UNSET,
+    _retry: bool = True,
+) -> dict:
     """POST a JSON-RPC request; auto-initialises session and retries once on stale."""
     if url not in _session_ids:
         try:
@@ -181,23 +316,30 @@ async def _post(url: str, method: str, params: dict, *, _retry: bool = True) -> 
 
     payload = {"jsonrpc": "2.0", "id": _next_id(), "method": method, "params": params}
     try:
-        resp = await _http.post(url, json=payload, headers=_build_headers(url))
+        resp = await _http.post(
+            url, json=payload, headers=_build_headers(url), timeout=_timeout(read_timeout)
+        )
     except httpx.RemoteProtocolError as exc:
         # Stale keepalive connection (IDE closed it while router was idle).
         # httpx removes the dead connection from its pool; reinitialise and retry once.
         if _retry:
             log.warning("Stale connection to %s (%s); reinitialising and retrying", url, exc)
             _session_ids.pop(url, None)
-            return await _post(url, method, params, _retry=False)
+            return await _post(
+                url, method, params, read_timeout=read_timeout, _retry=False
+            )
         raise ConnectionError(f"IDE at {url} protocol error: {exc}") from exc
-    except (httpx.ConnectError, httpx.TimeoutException) as exc:
+    except httpx.ConnectError as exc:
         raise ConnectionError(f"IDE at {url} unreachable: {exc}") from exc
+    except httpx.TimeoutException as exc:
+        log.warning("IDE at %s timed out while handling %s: %s", url, method, exc)
+        raise TimeoutError(f"IDE at {url} timed out while handling {method}: {exc}") from exc
 
     if resp.status_code == 404 and _retry:
         # Session expired (IDE restarted); reinitialise and retry once
         log.warning("Session at %s expired (404); reinitialising", url)
         _session_ids.pop(url, None)
-        return await _post(url, method, params, _retry=False)
+        return await _post(url, method, params, read_timeout=read_timeout, _retry=False)
 
     resp.raise_for_status()
 
@@ -262,7 +404,7 @@ async def _project_paths_at(url: str) -> list[str]:
             except json.JSONDecodeError:
                 pass
         return paths
-    except ConnectionError as exc:
+    except (ConnectionError, TimeoutError) as exc:
         log.debug("get_repositories at %s unreachable: %s", url, exc)
         return []
     except Exception as exc:
@@ -350,7 +492,7 @@ async def handle_list_tools() -> list[types.Tool]:
             tools = result.get("tools", [])
             log.info("Collected %d tools from port %d", len(tools), port)
             return tools
-        except ConnectionError as exc:
+        except (ConnectionError, TimeoutError) as exc:
             log.debug("tools/list at port %d unreachable: %s", port, exc)
             return []
         except Exception as exc:
@@ -364,13 +506,13 @@ async def handle_list_tools() -> list[types.Tool]:
     for tools in all_results:
         for t in tools:
             name = t["name"]
+            input_schema = _tool_schema(t.get("inputSchema"))
+            _remember_tool_timeout_semantics(name, input_schema)
             if name not in seen:
                 seen[name] = types.Tool(
                     name=name,
                     description=t.get("description", ""),
-                    inputSchema=t.get(
-                        "inputSchema", {"type": "object", "properties": {}}
-                    ),
+                    inputSchema=input_schema,
                 )
 
     if not seen:
@@ -398,10 +540,13 @@ async def handle_call_tool(
     )
     resolved = str(Path(project_path).resolve())
     args["projectPath"] = resolved
+    read_timeout = _resolve_tool_read_timeout(name, args)
 
     url = await _route(resolved)
     log.info("tool=%s → %s (project: %s)", name, url, resolved)
-    result = await _post(url, "tools/call", {"name": name, "arguments": args})
+    result = await _post(
+        url, "tools/call", {"name": name, "arguments": args}, read_timeout=read_timeout
+    )
 
     items: list[types.TextContent | types.ImageContent | types.EmbeddedResource] = []
     for item in result.get("content", []):
@@ -428,9 +573,7 @@ async def handle_call_tool(
 async def _run() -> None:
     global _http
     _load_cache()
-    _http = httpx.AsyncClient(
-        timeout=httpx.Timeout(connect=1.5, read=60.0, write=10.0, pool=5.0)
-    )
+    _http = httpx.AsyncClient(timeout=_timeout())
     try:
         async with stdio_server() as (read_stream, write_stream):
             await server.run(
